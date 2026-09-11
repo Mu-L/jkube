@@ -21,15 +21,16 @@ import org.eclipse.jkube.kit.common.util.Serialization;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
+import java.util.Optional;
 import java.util.jar.JarFile;
 import java.util.stream.Collectors;
-import java.util.zip.ZipEntry;
 
 public class SpringBootLayeredJar {
+
+  static final String JARMODE_TOOLS = "tools";
+  static final String JARMODE_LAYERTOOLS = "layertools";
 
   private final File layeredJar;
   private final KitLogger kitLogger;
@@ -43,26 +44,28 @@ public class SpringBootLayeredJar {
     try (JarFile jarFile = new JarFile(layeredJar)) {
       return jarFile.getEntry("BOOT-INF/layers.idx") != null && StringUtils.isNotBlank(getMainClass());
     } catch(Exception e) {
-      kitLogger.debug("Couldn't determine if Spring Boot jar %s is layered", layeredJar.getName(), e);
+      kitLogger.debug("Couldn't determine if Spring Boot jar %s is layered: %s", layeredJar.getName(), e.getMessage());
     }
     return false;
   }
 
   public String getMainClass() {
+    return getManifestAttribute("Main-Class").orElse(null);
+  }
+
+  public Optional<String> getSpringBootVersion() {
+    return getManifestAttribute("Spring-Boot-Version");
+  }
+
+  private Optional<String> getManifestAttribute(String attributeName) {
     try (JarFile jarFile = new JarFile(layeredJar)) {
-      final ZipEntry manifest = jarFile.getEntry("META-INF/MANIFEST.MF");
-      if (manifest == null) {
-        return null;
+      if (jarFile.getManifest() != null) {
+        return Optional.ofNullable(jarFile.getManifest().getMainAttributes().getValue(attributeName));
       }
-      final Properties properties = new Properties();
-      try (InputStream manifestInputStream = jarFile.getInputStream(manifest)) {
-        properties.load(manifestInputStream);
-        return properties.getProperty("Main-Class");
-      }
-    } catch(Exception e) {
-      kitLogger.debug("Couldn't determine Spring Boot jar's (%s) main class ", layeredJar.getName(), e);
+    } catch (IOException e) {
+      kitLogger.debug("Couldn't read %s from %s: %s", attributeName, layeredJar.getName(), e.getMessage());
     }
-    return null;
+    return Optional.empty();
   }
 
   public List<String> listLayers() {
@@ -81,26 +84,109 @@ public class SpringBootLayeredJar {
   }
 
   public void extractLayers(File extractionDir) {
-    try {
-      new LayerToolsCommand(kitLogger, extractionDir, layeredJar,  "extract").execute();
-    } catch (IOException ioException) {
-      throw new IllegalStateException("Failure in extracting spring boot jar layers", ioException);
+    // Execute jarmode to extract layers
+    // Note: Requires Maven/Gradle JDK to be compatible with application target JDK
+    String jarMode = determineJarMode();
+    IOException primaryException = null;
+
+    if (jarMode != null) {
+      try {
+        String[] extractArgs = getExtractArgs(jarMode);
+        executeLayerToolsCommand(extractionDir, jarMode, extractArgs);
+        kitLogger.info("Extracted Spring Boot layers using jarmode=%s", jarMode);
+        return;
+      } catch (IOException ioException) {
+        kitLogger.debug("Failed with jarmode=%s: %s", jarMode, ioException.getMessage());
+        primaryException = ioException;
+      }
+    }
+
+    // Fallback: try both jarmodes only if version detection failed
+    if (jarMode == null) {
+      for (String fallbackJarMode : new String[]{JARMODE_TOOLS, JARMODE_LAYERTOOLS}) {
+        try {
+          kitLogger.debug("Trying jarmode=%s for layer extraction", fallbackJarMode);
+          String[] extractArgs = getExtractArgs(fallbackJarMode);
+          executeLayerToolsCommand(extractionDir, fallbackJarMode, extractArgs);
+          kitLogger.info("Extracted Spring Boot layers using jarmode=%s (fallback)", fallbackJarMode);
+          return;
+        } catch (IOException ioException) {
+          kitLogger.debug("Failed with jarmode=%s: %s", fallbackJarMode, ioException.getMessage());
+          if (primaryException == null) {
+            primaryException = ioException;
+          } else {
+            primaryException.addSuppressed(ioException);
+          }
+        }
+      }
+    }
+    throw new IllegalStateException("Failure in extracting spring boot jar layers", primaryException);
+  }
+
+  // Package-private seam for testing - allows tests to observe command invocations
+  void executeLayerToolsCommand(File extractionDir, String jarMode, String[] extractArgs) throws IOException {
+    new LayerToolsCommand(kitLogger, extractionDir, layeredJar, jarMode, extractArgs).execute();
+  }
+
+  // Package-private for testing
+  String[] getExtractArgs(String jarMode) {
+    // Spring Boot 4.1+ tools jarmode: requires --launcher and --layers for layered structure,
+    // --destination to control output location, and --force for idempotent extraction
+    if (JARMODE_TOOLS.equals(jarMode)) {
+      return new String[]{"extract", "--launcher", "--layers", "--destination", ".", "--force"};
+    } else {
+      // Spring Boot < 4.1 layertools jarmode: supports --destination but not --force
+      return new String[]{"extract", "--destination", "."};
     }
   }
 
+  // Package-private for testing
+  boolean isVersion410OrNewer(String version) {
+    try {
+      String[] parts = version.split("[.-]");
+      if (parts.length < 2) {
+        return false;
+      }
+      int major = Integer.parseInt(parts[0]);
+      int minor = Integer.parseInt(parts[1]);
+
+      return major > 4 || (major == 4 && minor >= 1);
+    } catch (NumberFormatException e) {
+      kitLogger.debug("Unable to parse Spring Boot version %s: %s", version, e.getMessage());
+      return false;
+    }
+  }
+
+  // Package-private for testing
+  String determineJarMode() {
+    Optional<String> version = getSpringBootVersion();
+    if (version.isPresent() && isVersion410OrNewer(version.get())) {
+      return JARMODE_TOOLS;
+    } else if (version.isPresent()) {
+      return JARMODE_LAYERTOOLS;
+    }
+    return null;
+  }
+
+  /**
+   * Command executor for both Spring Boot jarmodes (layertools and tools).
+   * Runs java -Djarmode={jarMode} -jar {jar} {args}
+   */
   private static class LayerToolsCommand extends ExternalCommand {
     private final File layeredJar;
     private final String[] args;
+    private final String jarMode;
 
-    protected LayerToolsCommand(KitLogger log, File workDir, File layeredJar, String... args) {
+    protected LayerToolsCommand(KitLogger log, File workDir, File layeredJar, String jarMode, String... args) {
       super(log, workDir);
       this.layeredJar = layeredJar;
+      this.jarMode = jarMode;
       this.args = args;
     }
 
     @Override
     protected String[] getArgs() {
-      return ArrayUtils.addAll(new String[] { "java", "-Djarmode=layertools", "-jar", layeredJar.getAbsolutePath()}, args);
+      return ArrayUtils.addAll(new String[] { "java", "-Djarmode=" + jarMode, "-jar", layeredJar.getAbsolutePath()}, args);
     }
   }
 
